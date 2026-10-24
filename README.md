@@ -73,6 +73,12 @@
 
 未配置 `DEEPL_AUTH_KEY` 时不会向 DeepL 发送任何文本,仅在注入器日志中提示配置要求。DeepL API 的用量、费用及隐私条款由用户账户和套餐决定。
 
+## 故障排查
+
+- 隐藏启动后仍显示英文：检查 `COPILOT_ZH_CACHE_DIR` 下的 `injector.log`。如果反复出现“无法连接 CDP 端口 9222”，说明 WebView2 没有开放调试接口，注入器尚未连接到页面。
+- WebView2 Runtime 150 及更高版本会在宿主进程以管理员权限运行时忽略用户级 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`。可改为以普通权限启动 Copilot；若必须以管理员权限运行，则需要管理员按 Microsoft WebView2 文档配置机器级策略 `HKLM\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`，其中字符串值 `github.exe` 设置为 `--remote-debugging-port=9222`。此设置会持续生效，并允许本机程序调试 Copilot 页面；请勿将该端口暴露到网络。
+- 更新策略或启动参数后，先完全退出 Copilot，再重新运行中文版启动器。确认 `http://127.0.0.1:9222/json` 能返回页面目标后，注入才会生效。
+
 ## 文件结构
 
 ```
