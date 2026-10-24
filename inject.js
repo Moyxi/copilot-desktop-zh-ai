@@ -7,6 +7,7 @@ const { execFile } = require('child_process');
 const DICT_PATH = path.join(__dirname, 'dictionary.json');
 const AUTO_CACHE_DIR = process.env.COPILOT_ZH_CACHE_DIR || path.join(__dirname, 'cache');
 const AUTO_TRANSLATIONS_PATH = path.join(AUTO_CACHE_DIR, 'auto-translations.jsonl');
+const LOG_PATH = path.join(AUTO_CACHE_DIR, 'injector.log');
 const UPSTREAM_REFRESH_MS = 6 * 60 * 60 * 1000;
 let upstreamDictionary = null;
 let lastUpstreamRefresh = 0;
@@ -14,8 +15,23 @@ let upstreamRefresh = null;
 let autoTranslations = {};
 const pendingTranslations = new Set();
 let missingDeepLKeyWarningLogged = false;
+let lastCDPWarningAt = 0;
 
 fs.mkdirSync(AUTO_CACHE_DIR, { recursive: true });
+
+for (const level of ['log', 'warn', 'error']) {
+  const original = console[level].bind(console);
+  console[level] = (...values) => {
+    const line = new Date().toISOString() + ' [' + level.toUpperCase() + '] ' +
+      values.map((value) => value instanceof Error ? (value.stack || value.message) : String(value)).join(' ');
+    try {
+      fs.appendFileSync(LOG_PATH, line + '\n', 'utf8');
+    } catch (error) {
+      process.stderr.write('[copilot-zh] 日志写入失败：' + error.message + '\n');
+    }
+    original(...values);
+  };
+}
 
 function loadAutoTranslations() {
   try {
@@ -135,7 +151,10 @@ async function translateUnknownSettings(values) {
   }
   const texts = [...new Set(values)]
     .map((text) => text.trim())
-    .filter((text) => text.length >= 4 && text.length <= 1000 && /[A-Za-z]{3}/.test(text) && !pendingTranslations.has(text) && !Object.hasOwn(autoTranslations, text));
+    .filter((text) => text.length >= 4 && text.length <= 400 && /[A-Za-z]{3}/.test(text) &&
+      !/(?:https?:\/\/|www\.|[A-Za-z]:\\|\\\\)/i.test(text) &&
+      !/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(text) &&
+      !pendingTranslations.has(text) && !Object.hasOwn(autoTranslations, text));
   if (!texts.length) return;
   texts.forEach((text) => pendingTranslations.add(text));
   try {
@@ -175,19 +194,24 @@ function buildPayload() {
     "    let replaced = 0;" +
     "    const untranslatedSettings = new Set();" +
     "    const settingsTextNodes = new Set();" +
-    "    document.querySelectorAll('[role=\"switch\"],input[type=\"checkbox\"]').forEach(control => {" +
-    "      let row = control.parentElement;" +
-    "      for (let depth = 0; row && depth < 6; depth++, row = row.parentElement) {" +
-    "        const controls = row.querySelectorAll('[role=\"switch\"],input[type=\"checkbox\"]').length;" +
-    "        const rowText = (row.innerText || '').trim();" +
-    "        if (controls === 1 && rowText.length >= 12 && rowText.length <= 1200) {" +
-    "          const rowWalker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);" +
-    "          let rowNode;" +
-    "          while (rowNode = rowWalker.nextNode()) settingsTextNodes.add(rowNode);" +
-    "          break;" +
+    "    const collectSettingsTextNodes = root => {" +
+    "      root.querySelectorAll('[role=\"switch\"],input[type=\"checkbox\"]').forEach(control => {" +
+    "        let row = control.parentElement;" +
+    "        for (let depth = 0; row && depth < 6; depth++, row = row.parentElement) {" +
+    "          const controls = row.querySelectorAll('[role=\"switch\"],input[type=\"checkbox\"]').length;" +
+    "          const rowText = (row.innerText || '').trim();" +
+    "          if (controls === 1 && rowText.length >= 12 && rowText.length <= 1200) {" +
+    "            const rowWalker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);" +
+    "            let rowNode;" +
+    "            while (rowNode = rowWalker.nextNode()) {" +
+    "              if (!rowNode.parentElement || !rowNode.parentElement.closest('pre, code, script, style, textarea, input, [contenteditable=\"true\"]')) settingsTextNodes.add(rowNode);" +
+    "            }" +
+    "            break;" +
+    "          }" +
     "        }" +
-    "      }" +
-    "    });" +
+    "      });" +
+    "    };" +
+    "    collectSettingsTextNodes(document);" +
     "    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);" +
     "    let n;" +
     "    while (n = walker.nextNode()) {" +
@@ -258,6 +282,7 @@ function buildPayload() {
     "    };" +
     "    collectShadowRoots(document);" +
     "    shadowRoots.forEach(root => {" +
+    "      collectSettingsTextNodes(root);" +
     "      const sw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);" +
     "      let sn;" +
     "      while (sn = sw.nextNode()) {" +
@@ -266,6 +291,7 @@ function buildPayload() {
     "        let sv = DICT.texts[st];" +
     "        if (sv === undefined) { for (let i = 0; i < textRes.length; i++) { textRes[i][0].lastIndex = 0; if (textRes[i][0].test(st)) { textRes[i][0].lastIndex = 0; sv = st.replace(textRes[i][0], textRes[i][1]); break; } } }" +
     "        if (sv !== undefined && sn.nodeValue !== sv) { sn.nodeValue = sv; replaced++; }" +
+    "        if (sv === undefined && settingsTextNodes.has(sn) && /[A-Za-z]{3}/.test(st) && !/^[A-Z0-9_./:-]+$/.test(st)) untranslatedSettings.add(st);" +
     "      }" +
     "      root.querySelectorAll('[placeholder],[data-placeholder],[aria-label],[title],[alt]').forEach(el => {" +
     "        ['placeholder','data-placeholder','aria-label','title','alt'].forEach(a => { const av = el.getAttribute(a); if (!av) return; if (DICT.attrs[av] !== undefined) { el.setAttribute(a, DICT.attrs[av]); return; } if (DICT.texts[av] !== undefined) { el.setAttribute(a, DICT.texts[av]); return; } for (let i = 0; i < attrRes.length; i++) { attrRes[i][0].lastIndex = 0; if (attrRes[i][0].test(av)) { attrRes[i][0].lastIndex = 0; el.setAttribute(a, av.replace(attrRes[i][0], attrRes[i][1])); break; } } });" +
@@ -289,9 +315,37 @@ function buildPayload() {
 
 function getTargets() {
   return new Promise((resolve, reject) => {
-    http.get('http://127.0.0.1:9222/json', (res) => {
-      let d = ''; res.on('data', (c) => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { resolve([]); } });
-    }).on('error', () => resolve([]));
+    const request = http.get('http://127.0.0.1:9222/json', (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          resolve([]);
+          return;
+        }
+        try {
+          const targets = JSON.parse(data);
+          if (!Array.isArray(targets)) throw new Error('CDP 返回的目标列表格式无效');
+          if (!targets.some((target) => target.type === 'page') && Date.now() - lastCDPWarningAt > 10000) {
+            console.warn('[copilot-zh] CDP 端口已连接，但没有可注入的页面目标。');
+            lastCDPWarningAt = Date.now();
+          }
+          resolve(targets);
+        } catch (error) {
+          console.warn('[copilot-zh] 无法解析 CDP 目标列表：' + error.message);
+          resolve([]);
+        }
+      });
+    });
+    request.setTimeout(2000, () => request.destroy(new Error('CDP 连接超时')));
+    request.on('error', (error) => {
+      if (Date.now() - lastCDPWarningAt > 10000) {
+        console.warn('[copilot-zh] 无法连接 CDP 端口 9222：' + (error.code || error.message));
+        lastCDPWarningAt = Date.now();
+      }
+      resolve([]);
+    });
   });
 }
 
