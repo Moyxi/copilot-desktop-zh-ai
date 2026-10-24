@@ -2,19 +2,14 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
-const https = require('https');
 const { execFile } = require('child_process');
 const DICT_PATH = path.join(__dirname, 'dictionary.json');
 const AUTO_CACHE_DIR = process.env.COPILOT_ZH_CACHE_DIR || path.join(__dirname, 'cache');
-const AUTO_TRANSLATIONS_PATH = path.join(AUTO_CACHE_DIR, 'auto-translations.jsonl');
 const LOG_PATH = path.join(AUTO_CACHE_DIR, 'injector.log');
 const UPSTREAM_REFRESH_MS = 6 * 60 * 60 * 1000;
 let upstreamDictionary = null;
 let lastUpstreamRefresh = 0;
 let upstreamRefresh = null;
-let autoTranslations = {};
-const pendingTranslations = new Set();
-let missingDeepLKeyWarningLogged = false;
 let lastCDPWarningAt = 0;
 
 fs.mkdirSync(AUTO_CACHE_DIR, { recursive: true });
@@ -33,25 +28,9 @@ for (const level of ['log', 'warn', 'error']) {
   };
 }
 
-function loadAutoTranslations() {
-  try {
-    return fs.readFileSync(AUTO_TRANSLATIONS_PATH, 'utf8')
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .reduce((result, line) => Object.assign(result, JSON.parse(line)), {});
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      console.warn('[copilot-zh] 自动翻译缓存读取失败：' + error.message);
-    }
-    return {};
-  }
-}
-
-autoTranslations = loadAutoTranslations();
-
 function mergeDictionaries(local, upstream) {
   const merged = { ...(upstream || {}), ...local };
-  merged.texts = { ...autoTranslations, ...((upstream && upstream.texts) || {}), ...(local.texts || {}) };
+  merged.texts = { ...((upstream && upstream.texts) || {}), ...(local.texts || {}) };
   for (const section of ['attrs', 'wholeElements']) {
     merged[section] = { ...((upstream && upstream[section]) || {}), ...(local[section] || {}) };
   }
@@ -95,90 +74,6 @@ function refreshUpstreamDictionary() {
   return upstreamRefresh;
 }
 
-function translateWithDeepL(texts, authKey) {
-  return new Promise((resolve, reject) => {
-    const form = new URLSearchParams();
-    form.set('auth_key', authKey);
-    form.set('source_lang', 'EN');
-    form.set('target_lang', 'ZH');
-    form.set('preserve_formatting', '1');
-    for (const text of texts) form.append('text', text);
-    const body = form.toString();
-    const hostname = authKey.endsWith(':fx') ? 'api-free.deepl.com' : 'api.deepl.com';
-    const request = https.request({
-      hostname,
-      path: '/v2/translate',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body)
-      },
-      timeout: 20000
-    }, (response) => {
-      let data = '';
-      response.setEncoding('utf8');
-      response.on('data', (chunk) => data += chunk);
-      response.on('end', () => {
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          reject(new Error('DeepL 返回 HTTP ' + response.statusCode + ': ' + data.slice(0, 300)));
-          return;
-        }
-        try {
-          const result = JSON.parse(data);
-          if (!Array.isArray(result.translations) || result.translations.length !== texts.length) {
-            throw new Error('DeepL 返回的译文数量不匹配');
-          }
-          resolve(result.translations.map((item) => item.text));
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-    request.on('timeout', () => request.destroy(new Error('DeepL 请求超时')));
-    request.on('error', reject);
-    request.end(body);
-  });
-}
-
-async function translateUnknownSettings(values) {
-  const authKey = process.env.DEEPL_AUTH_KEY;
-  if (!authKey) {
-    if (values.length && !missingDeepLKeyWarningLogged) {
-      console.warn('[copilot-zh] 设置页发现未收录英文选项；配置本机环境变量 DEEPL_AUTH_KEY 后可自动翻译。未发送任何文本。');
-      missingDeepLKeyWarningLogged = true;
-    }
-    return;
-  }
-  const texts = [...new Set(values)]
-    .map((text) => text.trim())
-    .filter((text) => text.length >= 4 && text.length <= 400 && /[A-Za-z]{3}/.test(text) &&
-      !/(?:https?:\/\/|www\.|[A-Za-z]:\\|\\\\)/i.test(text) &&
-      !/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(text) &&
-      !pendingTranslations.has(text) && !Object.hasOwn(autoTranslations, text));
-  if (!texts.length) return;
-  texts.forEach((text) => pendingTranslations.add(text));
-  try {
-    for (let i = 0; i < texts.length; i += 30) {
-      const batch = texts.slice(i, i + 30);
-      const translations = await translateWithDeepL(batch, authKey);
-      const additions = {};
-      batch.forEach((source, index) => {
-        const translated = translations[index]?.trim();
-        if (translated && /[\u3400-\u9fff]/.test(translated)) additions[source] = translated;
-      });
-      if (Object.keys(additions).length) {
-        fs.appendFileSync(AUTO_TRANSLATIONS_PATH, Object.entries(additions).map(([source, translated]) => JSON.stringify({ [source]: translated })).join('\n') + '\n', 'utf8');
-        autoTranslations = { ...autoTranslations, ...additions };
-        console.log('[copilot-zh] DeepL 已翻译并缓存 ' + Object.keys(additions).length + ' 条设置选项');
-      }
-    }
-  } catch (error) {
-    console.warn('[copilot-zh] DeepL 自动翻译失败：' + error.message);
-  } finally {
-    texts.forEach((text) => pendingTranslations.delete(text));
-  }
-}
-
 function buildPayload() {
   const localDictionary = JSON.parse(fs.readFileSync(DICT_PATH, 'utf8'));
   const DICT = mergeDictionaries(localDictionary, upstreamDictionary);
@@ -192,26 +87,6 @@ function buildPayload() {
     "const apply = () => {" +
     "  try {" +
     "    let replaced = 0;" +
-    "    const untranslatedSettings = new Set();" +
-    "    const settingsTextNodes = new Set();" +
-    "    const collectSettingsTextNodes = root => {" +
-    "      root.querySelectorAll('[role=\"switch\"],input[type=\"checkbox\"]').forEach(control => {" +
-    "        let row = control.parentElement;" +
-    "        for (let depth = 0; row && depth < 6; depth++, row = row.parentElement) {" +
-    "          const controls = row.querySelectorAll('[role=\"switch\"],input[type=\"checkbox\"]').length;" +
-    "          const rowText = (row.innerText || '').trim();" +
-    "          if (controls === 1 && rowText.length >= 12 && rowText.length <= 1200) {" +
-    "            const rowWalker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);" +
-    "            let rowNode;" +
-    "            while (rowNode = rowWalker.nextNode()) {" +
-    "              if (!rowNode.parentElement || !rowNode.parentElement.closest('pre, code, script, style, textarea, input, [contenteditable=\"true\"]')) settingsTextNodes.add(rowNode);" +
-    "            }" +
-    "            break;" +
-    "          }" +
-    "        }" +
-    "      });" +
-    "    };" +
-    "    collectSettingsTextNodes(document);" +
     "    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);" +
     "    let n;" +
     "    while (n = walker.nextNode()) {" +
@@ -223,19 +98,14 @@ function buildPayload() {
     "        if (n.nodeValue.trim() !== DICT.texts[t]) { n.nodeValue = DICT.texts[t]; replaced++; }" +
     "        continue;" +
     "      }" +
-    "      let patternMatched = false;" +
-    "      let tcount = 0, s = parent.firstChild;" +
-    "      while (s) { if (s.nodeType === 3 && s.textContent.trim()) tcount++; s = s.nextSibling; }" +
     "      for (let i = 0; i < textRes.length; i++) {" +
     "        textRes[i][0].lastIndex = 0;" +
     "        if (textRes[i][0].test(t)) {" +
     "          const v = t.replace(textRes[i][0], textRes[i][1]);" +
     "          if (n.nodeValue !== v) { n.nodeValue = v; replaced++; }" +
-    "          patternMatched = true;" +
     "          break;" +
     "        }" +
     "      }" +
-    "      if (!patternMatched && settingsTextNodes.has(n) && /[A-Za-z]{3}/.test(t) && !/^[A-Z0-9_./:-]+$/.test(t)) untranslatedSettings.add(t);" +
     "    }" +
     "    [...document.querySelectorAll('body *')].reverse().forEach(el => {" +
     "      if (el.closest('pre, code, script, style, textarea, [contenteditable=\"true\"]')) return;" +
@@ -291,14 +161,13 @@ function buildPayload() {
     "        let sv = DICT.texts[st];" +
     "        if (sv === undefined) { for (let i = 0; i < textRes.length; i++) { textRes[i][0].lastIndex = 0; if (textRes[i][0].test(st)) { textRes[i][0].lastIndex = 0; sv = st.replace(textRes[i][0], textRes[i][1]); break; } } }" +
     "        if (sv !== undefined && sn.nodeValue !== sv) { sn.nodeValue = sv; replaced++; }" +
-    "        if (sv === undefined && settingsTextNodes.has(sn) && /[A-Za-z]{3}/.test(st) && !/^[A-Z0-9_./:-]+$/.test(st)) untranslatedSettings.add(st);" +
     "      }" +
     "      root.querySelectorAll('[placeholder],[data-placeholder],[aria-label],[title],[alt]').forEach(el => {" +
     "        ['placeholder','data-placeholder','aria-label','title','alt'].forEach(a => { const av = el.getAttribute(a); if (!av) return; if (DICT.attrs[av] !== undefined) { el.setAttribute(a, DICT.attrs[av]); return; } if (DICT.texts[av] !== undefined) { el.setAttribute(a, DICT.texts[av]); return; } for (let i = 0; i < attrRes.length; i++) { attrRes[i][0].lastIndex = 0; if (attrRes[i][0].test(av)) { attrRes[i][0].lastIndex = 0; el.setAttribute(a, av.replace(attrRes[i][0], attrRes[i][1])); break; } } });" +
     "      });" +
     "    });" +
     "    if (document.title === 'GitHub Copilot') document.title = 'GitHub Copilot 中文版';" +
-    "    return { replaced, untranslatedSettings: [...untranslatedSettings].slice(0, 100) };" +
+    "    return { replaced };" +
     "  } catch (e) { return 'ERR:' + e.message; }" +
     "};" +
     "const res = apply();" +
@@ -381,11 +250,6 @@ async function loop() {
     const page = targets.find(t => t.type === 'page');
     if (page && page.webSocketDebuggerUrl) {
       const r = await injectOnce(page.webSocketDebuggerUrl, payload);
-      if (r && typeof r === 'object') {
-        if (Array.isArray(r.untranslatedSettings) && r.untranslatedSettings.length) {
-          translateUnknownSettings(r.untranslatedSettings);
-        }
-      }
       const now = Date.now();
       if (now - lastLog > 10000) {
         const result = r && typeof r === 'object' ? 'replaced:' + r.replaced : r;
